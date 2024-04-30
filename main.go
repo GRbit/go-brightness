@@ -9,19 +9,39 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/esiqveland/notify"
-	"github.com/godbus/dbus/v5"
-	"golang.org/x/exp/maps"
 	"golang.org/x/xerrors"
+	"github.com/godbus/dbus/v5"
+	"regexp"
+	"strings"
 )
 
 const (
 	idPath         = "/.local/.go-brightness-id-123458"
 	brightnessIcon = "/usr/share/icons/Papirus/64x64/apps/display-brightness.svg"
+
+	pciBrightness     = "/sys/devices/pci*/*/drm/card*/*/*/brightness"
+	pciBrightnessReg  = "/sys/devices/pci[^/]*/[^/]*/drm/card[^/]*/[^/]*/[^/]*/brightness"
+	backlight         = "/sys/devices/pci*/*/*/backlight/*/brightness"
+	backlightReg      = "/sys/devices/pci[^/]*/[^/]*/[^/]*/backlight/[^/]*/brightness"
+	classBacklight    = "/sys/class/backlight/*/brightness"
+	classBacklightReg = "/sys/class/backlight/(.*)/brightness"
 )
+
+type brightnessDevicePath struct {
+	glob   string
+	regexp string
+}
+
+func devicePaths() []brightnessDevicePath {
+	return []brightnessDevicePath{
+		{glob: pciBrightness, regexp: pciBrightnessReg},
+		{glob: backlight, regexp: backlightReg},
+		{glob: classBacklight, regexp: classBacklightReg},
+	}
+}
 
 func homeID() string {
 	return os.Getenv("HOME") + idPath
@@ -36,8 +56,13 @@ func main() {
 
 	b, err := readBrightness()
 	if err != nil {
-		log.Printf("failed to read brightness: %+v\n", err)
+		log.Println("failed to read brightness:", err)
+		debugP("verbose error: %+v", err)
 		os.Exit(2)
+	}
+
+	if !cfg.decrease && !cfg.increase {
+		return
 	}
 
 	sq := math.Sqrt(float64(b.current))
@@ -45,7 +70,7 @@ func main() {
 		sq = 1
 	}
 
-	debugPl("sq: ", sq)
+	debugP("sq: ", sq)
 
 	switch {
 	case cfg.decrease:
@@ -54,7 +79,7 @@ func main() {
 		b.set = int(math.Min(math.Max(float64(b.current)+sq, 0), float64(b.max)))
 	}
 
-	debugPl("setting brightness to", b.set, ", which in percents will be", b.willBeInPercents())
+	debugP("setting brightness to", b.set, ", which in percents will be", b.willBeInPercents())
 	if err = b.SetBrightness(); err != nil {
 		log.Printf("failed to set brightness: %+v\n", err)
 		os.Exit(3)
@@ -101,47 +126,84 @@ func (b *brightness) SetBrightness() error {
 }
 
 func readBrightness() (b brightness, err error) {
-	drm, err := filepath.Glob("/sys/devices/pci*/*/drm/card*/*/*/brightness")
-	if err != nil {
-		return b, xerrors.Errorf("globbing drm card brightness: %w", err)
+	brightDevs := make(map[string]string)
+
+	for _, p := range devicePaths() {
+		dd, err := filepath.Glob(p.glob)
+		if err != nil {
+			return b, xerrors.Errorf("globbing %q: %w", p, err)
+		}
+
+		debugP("looking for brightness devices: %+v", dd)
+
+		// compile regexp and find all mathing lines
+		r, err := regexp.Compile(p.regexp)
+		if err != nil {
+			return b, xerrors.Errorf("compiling regexp %q: %w", p.regexp, err)
+		}
+
+		for _, d := range dd {
+			debugP("d: '%+v'", d)
+			debugP("r: '%+v'", p.regexp)
+			matches := r.FindAllStringSubmatch(d, -1)
+			if matches == nil {
+				continue
+			}
+
+			debugP("matches: %+v", matches[0][1])
+
+			brightDevs[matches[0][1]] = d
+		}
 	}
 
-	debugPf("drm: %+v\n", drm)
-
-	bl, err := filepath.Glob("/sys/devices/pci*/*/*/backlight/*/brightness")
-	if err != nil {
-		return b, xerrors.Errorf("globbing pci backlight brightness: %w", err)
+	debugP("len(devices)=%d", len(brightDevs))
+	for k, v := range brightDevs {
+		debugP("path: %s", v)
+		if cfg.list {
+			fmt.Printf("%s: %s\n", k, v)
+		}
 	}
 
-	debugPf("bl: %+v\n", bl)
-
-	ddevices := make(map[string]string)
-	for _, m := range append(drm, bl...) {
-		tmp := filepath.Dir(filepath.Dir(m))
-		card := filepath.Base(filepath.Dir(tmp))
-		d := strings.TrimPrefix(filepath.Base(tmp), card)
-		d = strings.TrimPrefix(d, "-")
-		ddevices[d] = m
-	}
-
-	debugPf("len(devices)=%d\nnames: %+v\ndevices: %+v\n", len(ddevices), maps.Keys(ddevices), maps.Values(ddevices))
-
-	switch len(ddevices) {
+	switch len(brightDevs) {
 	case 0:
 		return b, xerrors.Errorf("no brightness files found")
 	case 1:
-		b.device = maps.Values(ddevices)[0]
+		if cfg.device != "" {
+			var ok bool
+			b.device, ok = brightDevs[cfg.device]
+			if !ok {
+				return b, xerrors.Errorf("device %q not found, please specify device from: %v", cfg.device,
+					brightDevs)
+			}
+		}
+
+		for _, v := range brightDevs {
+			b.device = v
+		}
 	default:
-		if cfg.device == "" {
-			return b, xerrors.Errorf("multiple brightness files found, please specify device from: %s",
-				strings.Join(maps.Keys(ddevices), ","))
+		if cfg.device == "" && cfg.devicePath == "" {
+			return b, xerrors.Errorf("multiple brightness files found, "+
+				"please specify device path or a device name from from: %v",
+				brightDevs)
+		}
+
+		if cfg.devicePath != "" {
+			break
 		}
 
 		var ok bool
-		b.device, ok = ddevices[cfg.device]
+		b.device, ok = brightDevs[cfg.device]
 		if !ok {
-			return b, xerrors.Errorf("device %q not found, please specify device from: %s", cfg.device,
-				strings.Join(maps.Keys(ddevices), ","))
+			return b, xerrors.Errorf("device %q not found, please specify device from: %v", cfg.device,
+				brightDevs)
+		}
+	}
+
+	if b.device == "" {
+		if cfg.devicePath != "" {
+			b.device = cfg.devicePath
+		} else {
+			return b, xerrors.Errorf("no device specified, please specify device from: %v", brightDevs)
 		}
 	}
 
@@ -155,7 +217,7 @@ func readBrightness() (b brightness, err error) {
 		return b, xerrors.Errorf("failed to get current brightness: %w", err)
 	}
 
-	debugPf("brightness: %+v\n", b)
+	debugP("brightness: %+v", b)
 
 	return b, nil
 }
@@ -184,22 +246,38 @@ func sentNotification(b brightness) (uint32, error) {
 		return 0, xerrors.Errorf("failed to send notification: %w", err)
 	}
 
-	debugPl("notification id =", nID)
+	debugP("notification id =", nID)
 
 	return nID, nil
 }
 
 type config struct {
-	debug    bool
-	increase bool
-	decrease bool
-	device   string
+	debug      bool
+	increase   bool
+	decrease   bool
+	list       bool
+	device     string
+	devicePath string
 }
 
 func readArgs() error {
+	if len(os.Args) < 2 {
+		return xerrors.Errorf("no arguments provided")
+	}
+
 	for i, a := range os.Args {
 		switch a {
-		case "-d":
+		case "-h", "--help", "help", "-help":
+			fmt.Println("Usage: go-brightness options/commands [device]")
+			fmt.Println("options and commands:")
+			fmt.Println("  -d: debug mode")
+			fmt.Println("  inc: increase brightness")
+			fmt.Println("  dec: decrease brightness")
+			fmt.Println("  ls: list available devices")
+			fmt.Println("device:")
+			fmt.Println("  Device name to set brightness for. If omitted, first found device will be used")
+			os.Exit(0)
+		case "-d", "--debug", "debug", "-debug", "dbg", "-dbg", "--dbg":
 			cfg.debug = true
 		case "inc", "-inc", "--inc", "increase", "-increase", "--increase":
 			if cfg.decrease {
@@ -211,13 +289,20 @@ func readArgs() error {
 				return xerrors.Errorf("conflicting arguments, you are trying to increase and decrease brightness")
 			}
 			cfg.decrease = true
+		case "list", "ls", "-list", "--list", "-l", "--ls":
+			cfg.list = true
 		default:
 			if i == 0 {
 				continue
 			}
 
-			cfg.device = a
-			debugPl("device =", a)
+			if strings.Contains(a, "/") {
+				cfg.devicePath = a
+				debugP("devicePath =", a)
+			} else {
+				cfg.device = a
+				debugP("device =", a)
+			}
 		}
 	}
 
@@ -262,14 +347,8 @@ func readFile(path string) (int, error) {
 	return n, nil
 }
 
-func debugPf(format string, a ...interface{}) {
+func debugP(format string, a ...interface{}) {
 	if cfg.debug {
-		fmt.Printf(format, a...)
-	}
-}
-
-func debugPl(a ...interface{}) {
-	if cfg.debug {
-		fmt.Println(a...)
+		fmt.Printf(format+"\n", a...)
 	}
 }
