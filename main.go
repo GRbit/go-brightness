@@ -7,19 +7,20 @@ import (
 	"log"
 	"math"
 	"os"
+	"path"
 	"path/filepath"
+	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/esiqveland/notify"
-	"golang.org/x/xerrors"
 	"github.com/godbus/dbus/v5"
-	"regexp"
-	"strings"
+	"golang.org/x/xerrors"
 )
 
 const (
-	idPath         = "/.local/.go-brightness-id-123458"
+	idPath         = ".local/.go-brightness-id-123458"
 	brightnessIcon = "/usr/share/icons/Papirus/64x64/apps/display-brightness.svg"
 
 	pciBrightness     = "/sys/devices/pci*/*/drm/card*/*/*/brightness"
@@ -29,6 +30,17 @@ const (
 	classBacklight    = "/sys/class/backlight/*/brightness"
 	classBacklightReg = "/sys/class/backlight/(.*)/brightness"
 )
+
+var cfg config
+
+type config struct {
+	debug      bool
+	increase   bool
+	decrease   bool
+	list       bool
+	device     string
+	devicePath string
+}
 
 type brightnessDevicePath struct {
 	glob   string
@@ -44,10 +56,8 @@ func devicePaths() []brightnessDevicePath {
 }
 
 func homeID() string {
-	return os.Getenv("HOME") + idPath
+	return path.Join(os.Getenv("HOME"), idPath)
 }
-
-var cfg config
 
 func main() {
 	if err := readArgs(); err != nil {
@@ -57,7 +67,7 @@ func main() {
 	b, err := readBrightness()
 	if err != nil {
 		log.Println("failed to read brightness:", err)
-		debugP("verbose error: %+v", err)
+		debugPf("verbose error: %+v", err)
 		os.Exit(2)
 	}
 
@@ -70,7 +80,7 @@ func main() {
 		sq = 1
 	}
 
-	debugP("sq: ", sq)
+	debugPf("sq: ", sq)
 
 	switch {
 	case cfg.decrease:
@@ -79,7 +89,7 @@ func main() {
 		b.set = int(math.Min(math.Max(float64(b.current)+sq, 0), float64(b.max)))
 	}
 
-	debugP("setting brightness to", b.set, ", which in percents will be", b.willBeInPercents())
+	debugPf("setting brightness to", b.set, ", which in percents will be", b.willBeInPercents())
 	if err = b.SetBrightness(); err != nil {
 		log.Printf("failed to set brightness: %+v\n", err)
 		os.Exit(3)
@@ -134,7 +144,7 @@ func readBrightness() (b brightness, err error) {
 			return b, xerrors.Errorf("globbing %q: %w", p, err)
 		}
 
-		debugP("looking for brightness devices: %+v", dd)
+		debugPf("looking for brightness devices: %+v", dd)
 
 		// compile regexp and find all mathing lines
 		r, err := regexp.Compile(p.regexp)
@@ -143,22 +153,22 @@ func readBrightness() (b brightness, err error) {
 		}
 
 		for _, d := range dd {
-			debugP("d: '%+v'", d)
-			debugP("r: '%+v'", p.regexp)
+			debugPf("d: '%+v'", d)
+			debugPf("r: '%+v'", p.regexp)
 			matches := r.FindAllStringSubmatch(d, -1)
 			if matches == nil {
 				continue
 			}
 
-			debugP("matches: %+v", matches[0][1])
+			debugPf("matches: %+v", matches[0][1])
 
 			brightDevs[matches[0][1]] = d
 		}
 	}
 
-	debugP("len(devices)=%d", len(brightDevs))
+	debugPf("len(devices)=%d", len(brightDevs))
 	for k, v := range brightDevs {
-		debugP("path: %s", v)
+		debugPf("path: %s", v)
 		if cfg.list {
 			fmt.Printf("%s: %s\n", k, v)
 		}
@@ -217,7 +227,7 @@ func readBrightness() (b brightness, err error) {
 		return b, xerrors.Errorf("failed to get current brightness: %w", err)
 	}
 
-	debugP("brightness: %+v", b)
+	debugPf("brightness: %+v", b)
 
 	return b, nil
 }
@@ -237,8 +247,9 @@ func sentNotification(b brightness) (uint32, error) {
 		AppName:       "go-brightness",
 		ReplacesID:    getID(),
 		AppIcon:       brightnessIcon,
-		Body:          fmt.Sprintf("Brightness set to: %d%%", b.willBeInPercents()),
 		Summary:       fmt.Sprintf("Brightness set to: %d%%", b.willBeInPercents()),
+		Body:          fmt.Sprintf("Brightness set to: %d%%", b.willBeInPercents()),
+		Actions:       nil,
 		Hints:         map[string]dbus.Variant{"value": dbus.MakeVariant(b.willBeInPercents())},
 		ExpireTimeout: time.Second * 2,
 	})
@@ -246,18 +257,9 @@ func sentNotification(b brightness) (uint32, error) {
 		return 0, xerrors.Errorf("failed to send notification: %w", err)
 	}
 
-	debugP("notification id =", nID)
+	debugPf("notification id =", nID)
 
 	return nID, nil
-}
-
-type config struct {
-	debug      bool
-	increase   bool
-	decrease   bool
-	list       bool
-	device     string
-	devicePath string
 }
 
 func readArgs() error {
@@ -298,10 +300,10 @@ func readArgs() error {
 
 			if strings.Contains(a, "/") {
 				cfg.devicePath = a
-				debugP("devicePath =", a)
+				debugPf("devicePath =", a)
 			} else {
 				cfg.device = a
-				debugP("device =", a)
+				debugPf("device =", a)
 			}
 		}
 	}
@@ -310,8 +312,7 @@ func readArgs() error {
 }
 
 func getID() uint32 {
-	if _, err := os.Stat(homeID()); errors.Is(err, os.ErrNotExist) {
-	} else if err != nil {
+	if _, err := os.Stat(homeID()); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return 0
 	}
 
@@ -329,25 +330,25 @@ func getID() uint32 {
 }
 
 func saveID(id uint32) error {
-	return os.WriteFile(homeID(), []byte(strconv.Itoa(int(id))), 0o777)
+	return os.WriteFile(homeID(), []byte(strconv.Itoa(int(id))), 0o600)
 }
 
-func readFile(path string) (int, error) {
-	buf, err := os.ReadFile(path)
+func readFile(p string) (int, error) {
+	buf, err := os.ReadFile(p)
 	if err != nil {
-		return 0, xerrors.Errorf("failed to read %q: %w", path, err)
+		return 0, xerrors.Errorf("failed to read %q: %w", p, err)
 	}
 
 	buf = bytes.TrimSpace(buf)
 	n, err := strconv.Atoi(string(buf))
 	if err != nil {
-		return 0, xerrors.Errorf("failed to parse %q: %w", path, err)
+		return 0, xerrors.Errorf("failed to parse %q: %w", p, err)
 	}
 
 	return n, nil
 }
 
-func debugP(format string, a ...interface{}) {
+func debugPf(format string, a ...interface{}) {
 	if cfg.debug {
 		fmt.Printf(format+"\n", a...)
 	}
