@@ -29,6 +29,8 @@ const (
 	backlightReg      = "/sys/devices/pci[^/]*/[^/]*/[^/]*/backlight/[^/]*/brightness"
 	classBacklight    = "/sys/class/backlight/*/brightness"
 	classBacklightReg = "/sys/class/backlight/(.*)/brightness"
+
+	defaultSteps = 20
 )
 
 var cfg config
@@ -40,6 +42,7 @@ type config struct {
 	list       bool
 	device     string
 	devicePath string
+	steps      int
 }
 
 type brightnessDevicePath struct {
@@ -75,21 +78,14 @@ func main() {
 		return
 	}
 
-	sq := math.Sqrt(float64(b.current))
-	if sq < 1 {
-		sq = 1
-	}
-
-	debugPf("sq: ", sq)
-
 	switch {
 	case cfg.decrease:
-		b.set = int(math.Max(float64(b.current)-sq, 0))
+		b.set = getRawValue(b, false)
 	case cfg.increase:
-		b.set = int(math.Min(math.Max(float64(b.current)+sq, 0), float64(b.max)))
+		b.set = getRawValue(b, true)
 	}
 
-	debugPf("setting brightness to", b.set, ", which in percents will be", b.willBeInPercents())
+	debugPf("setting brightness to %v, which in percents will be %v", b.set, b.willBeInPercents())
 	if err = b.SetBrightness(); err != nil {
 		log.Printf("failed to set brightness: %+v\n", err)
 		os.Exit(3)
@@ -105,6 +101,33 @@ func main() {
 		log.Printf("failed to save notification id to %q: %+v\n", homeID(), err)
 		os.Exit(5)
 	}
+}
+
+// Get raw hardware value for a specific level logarithmically
+func getRawValue(b brightness, increase bool) int {
+	level := math.Sqrt(float64(b.current)/float64(b.max)) * float64(cfg.steps)
+	debugPf("currentLevel %v", level)
+	if increase {
+		level++
+	} else {
+		level--
+	}
+
+	// Clamp level between 0 and TotalSteps
+	if level < 0 {
+		level = 0
+	}
+	if level > float64(cfg.steps) {
+		level = float64(cfg.steps)
+	}
+
+	debugPf("newLevel %v", level)
+
+	// Raw = (level / TotalSteps)^2 * Max
+	raw := int(math.Pow(level/float64(cfg.steps), 2) * float64(b.max))
+	debugPf("raw %v", raw)
+
+	return raw
 }
 
 type brightness struct {
@@ -267,7 +290,11 @@ func readArgs() error {
 		return xerrors.Errorf("no arguments provided")
 	}
 
-	for i, a := range os.Args {
+	cfg.steps = defaultSteps
+
+	var scanStep bool
+
+	for i, a := range os.Args[1:] {
 		switch a {
 		case "-h", "--help", "help", "-help":
 			fmt.Println("Usage: go-brightness options/commands [device]")
@@ -293,12 +320,20 @@ func readArgs() error {
 			cfg.decrease = true
 		case "list", "ls", "-list", "--list", "-l", "--ls":
 			cfg.list = true
+		case "steps", "s", "-s", "--steps", "-steps", "--st":
+			scanStep = true
 		default:
 			if i == 0 {
 				continue
-			}
-
-			if strings.Contains(a, "/") {
+			} else if scanStep {
+				var err error
+				cfg.steps, err = strconv.Atoi(a)
+				if err != nil {
+					fmt.Println("invalid arguemets for steps", os.Args[i+1], "err:", err)
+					os.Exit(2)
+				}
+				scanStep = false
+			} else if strings.Contains(a, "/") {
 				cfg.devicePath = a
 				debugPf("devicePath =", a)
 			} else {
@@ -306,6 +341,11 @@ func readArgs() error {
 				debugPf("device =", a)
 			}
 		}
+	}
+
+	if scanStep {
+		fmt.Println("no arguments after steps, must be int")
+		os.Exit(2)
 	}
 
 	return nil
